@@ -1,0 +1,289 @@
+from abc import ABC, abstractmethod
+import copy
+from typing import Any, Iterable
+
+
+class DotObject(ABC):
+    """
+    Abstract class for chained dot-accessible objects
+    """
+    @abstractmethod
+    def to_base_type(self):
+        """
+        Converts the object and all objects stored inside back to their base
+        types.
+        """
+        pass
+
+    def copy(self):
+        return copy.copy(self)
+
+    def deepcopy(self):
+        return copy.deepcopy(self)
+
+    @classmethod
+    def _hook(cls, item):
+        if isinstance(item, DotObject):
+            return item
+        if isinstance(item, dict):
+            return DotDict(item)
+        elif isinstance(item, tuple):
+            return DotTuple([cls._hook(elem) for elem in item])
+        elif isinstance(item, list):
+            return DotList([cls._hook(elem) for elem in item])
+        return item
+
+
+class SequenceMixin:
+    """
+    Mixing class to provide dot-accessible indices for items in the sequence.
+
+    I.e., using tup._1 returns the item at index = 1 within the object `tup`.
+
+    Supports indexing with lead-only underscore, and reverse indexing with
+    leading and trailing underscore.
+    """
+    @property
+    def first_(self):
+        if len(self):
+            return self[0]
+
+    @property
+    def last_(self):
+        if len(self):
+            return self[-1]
+
+    def nth(self, n: int):
+        return self[n]
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattribute__(name)
+        except AttributeError as err:
+            if name.startswith('_') and len(name) > 1:
+                try:
+                    return self.__getitem__(int(name[1:]))
+                except Exception:
+                    pass
+            # reverse indexing using leading and trailing underscores.
+            if name.startswith('_') and len(name) > 1 and name.endswith('_'):
+                try:
+                    return self.__getitem__(-1 * int(name[1:-1]))
+                except Exception:
+                    pass
+            raise err
+
+
+class DotDict(dict, DotObject):
+    """
+    Adaptation of the `addict.Dict` class for chained dot-accessible
+    dictionary construction.
+
+    >>> dd = DotDict()
+    >>> dd.query.match_phrase.message = 'test message'
+    >>> dd
+    {'query': {'match_phrase': {'message': 'test message'}}}
+    >>> print(json.dumps(dd, indent=2))
+    {
+      "query": {
+        "match_phrase": {
+        "message": "test message"
+        }
+      }
+    }
+    """
+    def __init__(self, *args, **kwargs) -> None:
+        object.__setattr__(self, '__parent', kwargs.pop('__parent', None))
+        object.__setattr__(self, '__key', kwargs.pop('__key', None))
+
+        for k, v in dict(*args, **kwargs).items():
+            self[k] = self._hook(v)
+
+    def __delattr__(self, name: str) -> None:
+        del self[name]
+
+    def __call__(self, value: Any=None, **kwargs):
+        """
+        Sets the value as the value to this object for the parent.  Passing
+        key word args constructions a dictionary for the value.
+
+        >>> d = DotDict()
+        >>> d.x.y([1, 2, 3])
+        >>> d
+        {'x': {'y': [1, 2, 3]}}
+        """
+        if (parent := object.__getattribute__(self, '__parent')) is None:
+            raise AttributeError('Only callable from a newly instantiated child element.')
+
+        if value is None and not kwargs:
+            return
+
+        if (value is not None) and kwargs:
+            raise ValueError('A value cannot be passed along with keyword args')
+
+        value = value if (value is not None) else kwargs
+        parent[object.__getattribute__(self, '__key')] = self._hook(value)
+        return self
+
+    @staticmethod
+    def __dir_key_check(key: Any) -> bool:
+        """
+        Returns if a key in the object is dot-accessible.
+        """
+        if not isinstance(key, str):
+            return False
+        if not key[0].isalpha:
+            return False
+        if not key.replace('_', '').isalnum():
+            return False
+        return True
+
+    def __dir__(self) -> list[str]:
+        # added for IDE autocompletion
+        cls_attrs = object.__dir__(self)
+        obj_keys = [k for k in self if self.__dir_key_check(k)]
+        return obj_keys + cls_attrs
+
+    def __getattr__(self, item):
+        return self.__getitem__(item)
+
+    def __missing__(self, name):
+        return self.__class__(__parent=self, __key=name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if hasattr(self.__class__, name):
+            raise AttributeError("Attribute {name!r} is read-only")
+        else:
+            self[name] = self._hook(value)
+
+    def __setitem__(self, name, value) -> None:
+        super().__setitem__(name, self._hook(value))
+        # add the object to the parent object if __key is present.
+        try:
+            parent = object.__getattribute__(self, '__parent')
+            key = object.__getattribute__(self, '__key')
+        except AttributeError:
+            parent = None
+            key = None
+        if parent is not None:
+            parent[key] = self
+            object.__delattr__(self, '__parent')
+            object.__delattr__(self, '__key')
+
+    def __deepcopy__(self, memo):
+        other = self.__class__()
+        memo[id(self)] = other
+        for key, value in self.items():
+            other[copy.deepcopy(key, memo)] = copy.deepcopy(value, memo)
+        return other
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self[key]
+        else:
+            self[key] = default
+            return default
+
+    def to_base_type(self) -> dict:
+        out = {}
+        for key, value in self.items():
+            if isinstance(value, DotObject):
+                out[key] = value.to_base_type()
+            else:
+                out[key] = value
+        return out
+
+    def __or__(self, other):
+        raise NotImplementedError
+
+    def __ior__(self, other):
+        raise NotImplementedError
+
+    def __ror__(self, other):
+        raise NotImplementedError
+
+
+class DotList(list, DotObject, SequenceMixin):
+    """
+    Dot-accessible list construction.  The items in the list can be accessed
+    using an underscore + int attribute, or the .first_ and .last_ properties.
+
+    >>> dl = DotList(['hello', 'world', 'test', 'post'])
+    >>> dl
+    ['hello', 'world', 'test', 'post']
+    >>> dl._0
+    'hello'
+    >>> dl._2
+    'test',
+    >>> dl._3_  # trailing underscore for reverse indexing, i = -3
+    'world'
+    >>> dl.last_
+    'post'
+    """
+    def __new__(self, _iterable: Iterable):
+        obj = list.__new__(self, (self._hook(e) for e in _iterable))
+        return obj
+
+    def append(self, __object: Any) -> None:
+        return super().append(self._hook(__object))
+
+    def extend(self, __iterable: Iterable) -> None:
+        return super().extend(self._hook(__iterable))
+
+    def to_base_type(self) -> list:
+        out = []
+        for item in self:
+            if isinstance(item, DotObject):
+                out.append(item.to_base_type())
+            else:
+                out.append(item)
+        return out
+
+    def __add__(self, other):
+        return self.__class__(self.__class__.__base__.__add__(self, other))
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+    def __mul__(self, val: int):
+        return self.__class__(super().__mul__(val))
+
+
+class DotTuple(tuple, DotObject, SequenceMixin):
+    """
+    Dot-accessible tuple construction.  The items in the tuple can be accessed
+    using an underscore + int attribute, or the .first_ and .last_ properties.
+
+    >>> dt = DotTuple(('hello', 'world', {'test': 'post'}))
+    >>> dt
+    ('hello', 'world', {'test': 'post'})
+    >>> dt._0
+    'hello'
+    >>> dt._1
+    'world',
+    >>> dt._1_  # trailing underscore for reverse indexing, i = -1
+    {'test': 'post'}
+    >>> dt.first_
+    'hello'
+    """
+    def __new__(self, _iterable: Iterable):
+        obj = tuple.__new__(self, (self._hook(e) for e in _iterable))
+        return obj
+
+    def to_base_type(self) -> tuple:
+        out = []
+        for item in self:
+            if isinstance(item, DotObject):
+                out.append(item.to_base_type())
+            else:
+                out.append(item)
+        return tuple(out)
+
+    def __add__(self, other):
+        return self.__class__(self.__class__.__base__.__add__(self, other))
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+    def __mul__(self, val: int):
+        return self.__class__(super().__mul__(val))
