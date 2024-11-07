@@ -1,5 +1,5 @@
 # dotdotdot
-Dot-accessible python dictionaries.
+Dot-accessible python dictionaries, lists, and tuples.
 
 ## Create a dot-accessible dictionary from dict
 ```python
